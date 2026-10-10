@@ -143,6 +143,8 @@ pub enum EqualizerCurveError {
     FrequenciesNotIncreasing { index: usize },
     #[error("the stored equalizer curve is malformed: {detail}")]
     Malformed { detail: String },
+    #[error("the equalizer curve could not be serialized: {detail}")]
+    SerializeFailed { detail: String },
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -183,6 +185,9 @@ impl EqualizerCurve {
     }
 
     pub fn from_gstreamer_levels(levels: [f64; 10]) -> Self {
+        // The centres are fixed, finite, strictly increasing and in range, and
+        // every gain is finite and clamped, so the invariants `new` checks hold
+        // by construction and the curve needs no validation pass.
         let points = GSTREAMER_EQUALIZER_CENTRES_HZ
             .into_iter()
             .zip(levels)
@@ -195,7 +200,7 @@ impl EqualizerCurve {
                 },
             })
             .collect();
-        Self::new(points).expect("the fixed GStreamer curve is valid")
+        Self { points }
     }
 
     pub fn points(&self) -> &[EqualizerPoint] {
@@ -244,20 +249,19 @@ impl EqualizerCurve {
     }
 
     pub fn project_to_gstreamer(&self) -> [f64; 10] {
-        let bands = GSTREAMER_EQUALIZER_CENTRES_HZ.map(|frequency_hz| EqualizerBand {
-            frequency_hz,
-            min_gain_db: GSTREAMER_MIN_GAIN_DB,
-            max_gain_db: GSTREAMER_MAX_GAIN_DB,
-        });
-        self.project(&bands)
-            .expect("the fixed GStreamer capabilities are valid")
-            .band_levels_db
-            .try_into()
-            .expect("the fixed projection has ten bands")
+        // The same sampling and clamping `project` applies to a validated
+        // band list, taken straight over the fixed centres so the ten-element
+        // result needs no conversion from a `Vec`.
+        GSTREAMER_EQUALIZER_CENTRES_HZ.map(|frequency_hz| {
+            self.sample(frequency_hz)
+                .clamp(GSTREAMER_MIN_GAIN_DB, GSTREAMER_MAX_GAIN_DB)
+        })
     }
 
-    pub(crate) fn serialize(&self) -> String {
-        serde_json::to_string(self).expect("validated finite points serialize as JSON")
+    pub(crate) fn serialize(&self) -> Result<String, EqualizerCurveError> {
+        serde_json::to_string(self).map_err(|error| EqualizerCurveError::SerializeFailed {
+            detail: error.to_string(),
+        })
     }
 
     /// Reads a stored curve. Validation lives in `Deserialize` now, so this no
@@ -269,10 +273,14 @@ impl EqualizerCurve {
     }
 
     fn sample(&self, frequency_hz: f64) -> f64 {
-        if frequency_hz <= self.points[0].frequency_hz {
-            return self.points[0].gain_db;
+        // A validated curve is never empty; a flat zero is the neutral answer
+        // should that ever not hold.
+        let (Some(first), Some(last)) = (self.points.first(), self.points.last()) else {
+            return 0.0;
+        };
+        if frequency_hz <= first.frequency_hz {
+            return first.gain_db;
         }
-        let last = self.points.last().expect("a validated curve is non-empty");
         if frequency_hz >= last.frequency_hz {
             return last.gain_db;
         }
@@ -400,7 +408,10 @@ mod tests {
 
         // And the door still opens for a curve that is actually valid.
         let curve = EqualizerCurve::from_gstreamer_levels([1.5; 10]);
-        assert_eq!(EqualizerCurve::parse(&curve.serialize()).unwrap(), curve);
+        assert_eq!(
+            EqualizerCurve::parse(&curve.serialize().unwrap()).unwrap(),
+            curve
+        );
     }
 
     #[test]
@@ -533,6 +544,39 @@ mod tests {
                     "{preset:?} and {other:?} share the same levels",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gstreamer_levels_always_form_a_curve_that_new_accepts() {
+        let probes = [
+            [f64::NAN; 10],
+            [f64::INFINITY; 10],
+            [f64::NEG_INFINITY; 10],
+            [1e9; 10],
+            [-1e9; 10],
+            [0.0; 10],
+            [4.0, 3.0, 2.0, 0.0, -1.0, 0.0, 2.0, 3.0, 4.0, 4.0],
+            [
+                f64::NAN,
+                f64::INFINITY,
+                1e9,
+                -1e9,
+                f64::NEG_INFINITY,
+                0.5,
+                -12.0,
+                12.0,
+                13.0,
+                -13.0,
+            ],
+        ];
+        for levels in probes {
+            let built = EqualizerCurve::from_gstreamer_levels(levels);
+            let validated = EqualizerCurve::new(built.points().to_vec())
+                .unwrap_or_else(|error| panic!("{levels:?} built an invalid curve: {error}"));
+            assert_eq!(validated, built);
+            let stored = built.serialize().unwrap();
+            assert_eq!(EqualizerCurve::parse(&stored).unwrap(), built);
         }
     }
 }

@@ -127,6 +127,11 @@ const OCEANO_PLACEHOLDER: [u8; PIXEL_COUNT] = [
 pub(super) const REFERENCE_THUMBNAILS: [[u8; PIXEL_COUNT]; 2] =
     [EMPTY_MD5_PLACEHOLDER, OCEANO_PLACEHOLDER];
 
+// The distance below is the minimum over this set; an empty set would make
+// every image look infinitely far from a placeholder, so the set is proven
+// non-empty at compile time instead of being trusted at run time.
+const _: () = assert!(!REFERENCE_THUMBNAILS.is_empty());
+
 pub(super) const PLACEHOLDER_RMSE_MAX: f64 = 0.0025;
 pub(super) const PLACEHOLDER_WARNING_RMSE_MAX: f64 = 0.05;
 
@@ -135,8 +140,7 @@ pub(super) fn placeholder_distance(image: &DynamicImage) -> f64 {
     REFERENCE_THUMBNAILS
         .iter()
         .map(|reference| normalized_rmse(&thumbnail, reference))
-        .reduce(f64::min)
-        .expect("the placeholder reference set must not be empty")
+        .fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(test)]
@@ -159,9 +163,14 @@ pub(super) fn thumbnail(image: &DynamicImage) -> [u8; PIXEL_COUNT] {
         )
         .into_raw()
     };
-    pixels
-        .try_into()
-        .expect("the portrait thumbnail dimensions must match PIXEL_COUNT")
+    // Both sides derive from the same dimension constants, so the copy fills
+    // the array exactly; a mismatch would leave the tail black rather than
+    // abort a cover fetch.
+    let mut thumbnail = [0_u8; PIXEL_COUNT];
+    for (slot, pixel) in thumbnail.iter_mut().zip(pixels) {
+        *slot = pixel;
+    }
+    thumbnail
 }
 
 fn normalized_rmse(left: &[u8; PIXEL_COUNT], right: &[u8; PIXEL_COUNT]) -> f64 {

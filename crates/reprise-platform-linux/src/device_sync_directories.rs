@@ -146,6 +146,22 @@ async fn resident_fold_equal_directory(
     }
 }
 
+/// The error for a GIO callback that was dropped without ever reporting. A
+/// callback that never fires because its operation was cancelled is a
+/// cancellation, not a failure of the device.
+fn callback_dropped(operation: &str, cancellable: Option<&gio::Cancellable>) -> gio::glib::Error {
+    if cancellable.is_some_and(gio::Cancellable::is_cancelled) {
+        return gio::glib::Error::new(
+            gio::IOErrorEnum::Cancelled,
+            &format!("GIO {operation} was cancelled"),
+        );
+    }
+    gio::glib::Error::new(
+        gio::IOErrorEnum::Failed,
+        &format!("GIO {operation} callback dropped"),
+    )
+}
+
 async fn make_directory(
     directory: gio::File,
     cancellable: Option<&gio::Cancellable>,
@@ -161,7 +177,7 @@ async fn make_directory(
     receiver
         .recv()
         .await
-        .expect("GIO directory creation callback dropped")
+        .unwrap_or_else(|_| Err(callback_dropped("directory creation", cancellable)))
 }
 
 async fn enumerate_directories(
@@ -181,7 +197,7 @@ async fn enumerate_directories(
     receiver
         .recv()
         .await
-        .expect("GIO directory enumeration callback dropped")
+        .unwrap_or_else(|_| Err(callback_dropped("directory enumeration", cancellable)))
 }
 
 async fn next_files(
@@ -200,7 +216,7 @@ async fn next_files(
     receiver
         .recv()
         .await
-        .expect("GIO directory batch callback dropped")
+        .unwrap_or_else(|_| Err(callback_dropped("directory batch", cancellable)))
 }
 
 fn check_cancelled(cancellable: Option<&gio::Cancellable>) -> Result<(), DeviceIoError> {

@@ -4,9 +4,10 @@ use std::path::Path;
 use reprise_core::library::{TagWriteLock, TagWriteLockAttempt};
 use reprise_core::library_doctor::{
     group_review_rows, scan_summary, DoctorError, DoctorReviewDisplayRow, DoctorReviewFilter,
-    DoctorReviewSession, DoctorScan, DoctorScanOptions, DoctorScanOutcome, DoctorScanRequest,
-    DoctorScopeRequest, DoctorValue, DoctorViewSnapshot, DoctorWriteControl, DoctorWriteReport,
-    DoctorWriteRow, DoctorWriteRowState, LibraryDoctor, ProblemClass, ProposalSource, ScanControl,
+    DoctorReviewRowState, DoctorReviewSession, DoctorScan, DoctorScanOptions, DoctorScanOutcome,
+    DoctorScanRequest, DoctorScopeRequest, DoctorValue, DoctorViewSnapshot, DoctorWriteControl,
+    DoctorWriteReport, DoctorWriteRow, DoctorWriteRowState, LibraryDoctor, ProblemClass,
+    ProposalSource, ScanControl,
 };
 
 use crate::data::{self, DataError};
@@ -412,26 +413,58 @@ fn album_dto(
     session: &DoctorReviewSession,
     album: reprise_core::library_doctor::DoctorReviewAlbum,
 ) -> DoctorAlbumDto {
-    let rows = album
+    let listed = album.rows.len();
+    let rows: Vec<DoctorReviewRowDto> = album
         .rows
         .into_iter()
-        .map(|display| review_row_dto(scan, session, display))
+        .filter_map(|display| review_row_dto(scan, session, display))
         .collect();
+    // Rows the session no longer holds are left out, and the counts follow the
+    // rows that are shown so the album never advertises more than it lists.
+    let (track_count, change_count) = if rows.len() == listed {
+        (album.track_count, album.change_count)
+    } else {
+        tracing::warn!(
+            album = %album.key,
+            dropped = listed - rows.len(),
+            "doctor review album lists rows the session no longer holds; counting the rest"
+        );
+        surviving_counts(session, &rows)
+    };
     DoctorAlbumDto {
         album_key: album.key,
         title: album.title,
         artist: album.artist,
-        track_count: album.track_count,
-        change_count: album.change_count,
+        track_count,
+        change_count,
         rows,
     }
+}
+
+/// The distinct tracks the listed rows touch and how many of those rows are
+/// selected, ready changes.
+fn surviving_counts(session: &DoctorReviewSession, rows: &[DoctorReviewRowDto]) -> (usize, usize) {
+    let tracks = rows
+        .iter()
+        .flat_map(|row| row.track_ids.iter().copied())
+        .collect::<HashSet<_>>();
+    let changes = rows
+        .iter()
+        .flat_map(|row| row.row_ids.iter())
+        .filter(|id| {
+            session.rows().iter().any(|row| {
+                row.id.raw() == **id && row.selected && row.state == DoctorReviewRowState::Ready
+            })
+        })
+        .count();
+    (tracks.len(), changes)
 }
 
 fn review_row_dto(
     scan: &DoctorScan,
     session: &DoctorReviewSession,
     display: DoctorReviewDisplayRow,
-) -> DoctorReviewRowDto {
+) -> Option<DoctorReviewRowDto> {
     let (row_ids, track_ids, applies_to_tracks) = match display {
         DoctorReviewDisplayRow::Track { row_id, track_id } => (vec![row_id], vec![track_id], 1),
         DoctorReviewDisplayRow::AllTracks {
@@ -446,11 +479,9 @@ fn review_row_dto(
             (row_ids, track_ids, track_count)
         }
     };
-    let row = session
-        .rows()
-        .iter()
-        .find(|row| row.id == row_ids[0])
-        .expect("grouped review row must belong to the session");
+    // A grouped row that no longer belongs to the session has nothing to show.
+    let first_row_id = row_ids.first()?;
+    let row = session.rows().iter().find(|row| row.id == *first_row_id)?;
     let track_title = (track_ids.len() == 1).then(|| {
         scan.tracks
             .iter()
@@ -459,7 +490,7 @@ fn review_row_dto(
             .map(|tags| tags.title.clone())
             .unwrap_or_default()
     });
-    DoctorReviewRowDto {
+    Some(DoctorReviewRowDto {
         row_ids: row_ids
             .into_iter()
             .map(reprise_core::library_doctor::DoctorReviewRowId::raw)
@@ -471,7 +502,7 @@ fn review_row_dto(
         current: row.current.clone(),
         proposed: row.proposed.clone(),
         source: proposal_source(row.source),
-    }
+    })
 }
 
 const fn proposal_source(source: ProposalSource) -> &'static str {

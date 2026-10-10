@@ -7,6 +7,14 @@ use crate::equalizer::EqualizerCurve;
 pub(crate) const LEGACY_EQUALIZER_BANDS_KEY: &str = "playback.equalizer_bands";
 pub(crate) const EQUALIZER_CURVE_KEY: &str = "playback.equalizer_curve";
 
+/// Serializes a curve for a bound parameter; the one failure is reported as a
+/// failed conversion instead of a panic.
+pub(crate) fn curve_to_sql(curve: &EqualizerCurve) -> Result<String, rusqlite::Error> {
+    curve
+        .serialize()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
 pub(crate) fn migrate_v53(conn: &Connection) -> Result<(), rusqlite::Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= 53 {
@@ -30,7 +38,7 @@ pub(crate) fn migrate_v53(conn: &Connection) -> Result<(), rusqlite::Error> {
         let curve = EqualizerCurve::from_gstreamer_levels(parse_legacy_levels(&value));
         transaction.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-            rusqlite::params![EQUALIZER_CURVE_KEY, curve.serialize()],
+            rusqlite::params![EQUALIZER_CURVE_KEY, curve_to_sql(&curve)?],
         )?;
     }
     transaction.execute(
@@ -62,4 +70,29 @@ fn parse_legacy_levels(value: &str) -> [f64; 10] {
         tracing::warn!(count, "wrong equalizer band count; using flat preset");
         [0.0; 10]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::equalizer::EqualizerPreset;
+
+    #[test]
+    fn curve_to_sql_text_reads_back_as_the_same_curve() {
+        for preset in EqualizerPreset::ALL {
+            let curve = preset.curve();
+            let text = curve_to_sql(&curve).unwrap();
+            assert_eq!(EqualizerCurve::parse(&text).unwrap(), curve, "{preset:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_levels_that_cannot_be_read_become_the_flat_curve() {
+        assert_eq!(parse_legacy_levels("not,numbers"), [0.0; 10]);
+        assert_eq!(parse_legacy_levels("1.0,2.0"), [0.0; 10]);
+        assert_eq!(
+            parse_legacy_levels("1,2,3,4,5,6,7,8,9,10"),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        );
+    }
 }

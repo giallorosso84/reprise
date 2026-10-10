@@ -5,6 +5,23 @@
 //! `change_log`, so a running app refreshes live. See `cli` for the surface and
 //! `commands` for the implementations.
 
+// Production code must not panic on bad input or broken invariants: every
+// fallible step returns an error instead. A genuine, documented invariant is
+// suppressed at its site with `#[expect(clippy::<lint>, reason = "…")]`, and
+// scripts/check-crate-layers.sh counts those suppressions against a budget.
+// Test builds are exempt; test doubles legitimately use unreachable!/expect.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable
+    )
+)]
+
 mod cli;
 mod clock;
 mod commands;
@@ -85,10 +102,14 @@ fn run_with_db(
         },
         Command::Instrumental { action } => run_instrumental(&db, staging_dir, action, json),
         Command::Jobs { action } => run_jobs(&db, staging_dir, action, json),
+        // `run` dispatches playback before the database is opened, so this arm
+        // is not reached. Were it reached, `db_open::open` above would already
+        // have opened and migrated the database, which playback must never do,
+        // so it is reported as an internal error instead of being run.
         #[cfg(feature = "mpris")]
-        Command::Playback { .. } => {
-            unreachable!("playback is dispatched before opening the database")
-        }
+        Command::Playback { .. } => Err(CliError::InvalidInput(
+            "playback is dispatched before the database is opened".to_owned(),
+        )),
     }
 }
 

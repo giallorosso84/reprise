@@ -36,6 +36,9 @@ enum SinkSession {
 pub(crate) enum FinishedAnalysis {
     Whole(Result<TrackRenderData, String>),
     Segmented(Vec<Result<TrackRenderData, String>>),
+    /// A second `finish` found no session. Nothing was measured and nothing is
+    /// wrong with the track, so the caller must not remember it as failed.
+    AlreadyFinished,
 }
 
 /// Owns one decode call's session. `stop_reason` is set from outside the
@@ -138,12 +141,17 @@ impl AnalysisPcmSink {
     /// Takes the session out and finishes it. Only ever called once, after
     /// the decode call has returned and cancellation has been ruled out.
     pub(super) fn finish(&self) -> FinishedAnalysis {
-        let session = self
+        // `finish` is called at most once per sink; a second call finds no
+        // session and says so without claiming the track failed.
+        let Some(session) = self
             .session
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-            .expect("finish is called at most once per sink");
+        else {
+            debug_assert!(false, "a sink was finished twice");
+            return FinishedAnalysis::AlreadyFinished;
+        };
         match session {
             SinkSession::Whole(session) => {
                 FinishedAnalysis::Whole(session.finish().map_err(|error| error.to_string()))

@@ -232,11 +232,11 @@ fn drain_snapshots(
         if shutting_down.load(Ordering::Relaxed) {
             return;
         }
-        let mut committed = false;
+        let mut committed = None;
         for wait in RETRY_BACKOFFS {
             match try_commit_latest(writer, &latest, flush_state) {
-                CommitOutcome::Committed => {
-                    committed = true;
+                CommitOutcome::Committed(sequence) => {
+                    committed = Some(sequence);
                     break;
                 }
                 CommitOutcome::RetryableFailure => {}
@@ -252,18 +252,19 @@ fn drain_snapshots(
                 return;
             }
         }
-        if !committed {
+        if committed.is_none() {
             match try_commit_latest(writer, &latest, flush_state) {
-                CommitOutcome::Committed => committed = true,
+                CommitOutcome::Committed(sequence) => committed = Some(sequence),
                 CommitOutcome::RetryableFailure => {}
                 CommitOutcome::PermanentFailure => return,
             }
         }
-        if committed {
-            let sequence = latest
-                .take()
-                .expect("a successful commit consumes the snapshot that was committed")
-                .sequence;
+        if let Some(sequence) = committed {
+            // The commit reports the sequence it wrote, so flush waiters are
+            // released by that sequence whatever `latest` holds. The committed
+            // snapshot is the one `latest` still holds.
+            debug_assert!(latest.is_some(), "a commit succeeded without a snapshot");
+            latest = None;
             snapshot_file.remove_if_sequence(sequence);
             mark_committed(flush_state, sequence);
             continue;
@@ -293,7 +294,8 @@ fn keep_newest(latest: &mut Option<PendingSnapshot>, candidate: PendingSnapshot)
 }
 
 enum CommitOutcome {
-    Committed,
+    /// The snapshot with this sequence is in the database.
+    Committed(u64),
     RetryableFailure,
     PermanentFailure,
 }
@@ -303,9 +305,11 @@ fn try_commit_latest(
     latest: &Option<PendingSnapshot>,
     flush_state: &Arc<(Mutex<FlushState>, Condvar)>,
 ) -> CommitOutcome {
-    let snapshot = latest
-        .as_ref()
-        .expect("the worker receives or retains a snapshot before every commit attempt");
+    // The worker receives or retains a snapshot before every commit attempt;
+    // with none there is nothing to commit, so it waits for the next one.
+    let Some(snapshot) = latest.as_ref() else {
+        return CommitOutcome::RetryableFailure;
+    };
     mark_attempted(flush_state, snapshot.sequence);
     try_commit(writer, snapshot)
 }
@@ -323,7 +327,7 @@ fn try_commit(writer: &Mutex<Db>, snapshot: &PendingSnapshot) -> CommitOutcome {
         }
     };
     match queue_persistence::save(&database, &snapshot.queue) {
-        Ok(()) => CommitOutcome::Committed,
+        Ok(()) => CommitOutcome::Committed(snapshot.sequence),
         Err(error) => {
             tracing::warn!(
                 %error,

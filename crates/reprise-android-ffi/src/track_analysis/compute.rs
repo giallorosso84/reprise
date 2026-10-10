@@ -342,7 +342,11 @@ impl AnalysisContext<'_> {
                 }
             }
         }
-        unreachable!("the compute loop always returns on its final round")
+        // Every round but the last may `continue`, so the loop ends here only
+        // when no round was left to run. That cannot happen while the loop
+        // runs at least once; `Cancelled` is retryable, never final.
+        debug_assert!(false, "the compute loop ended without a round to run");
+        Ok(AndroidAnalysisOutcome::Cancelled)
     }
 
     /// Whether the track holds all its rendering data, by the test the
@@ -463,8 +467,18 @@ impl AnalysisContext<'_> {
                 tracing::debug!(track_id, reason, "track analysis produced no data");
                 return self.mark_failed(fingerprint, &measured, &reason);
             }
+            // Only a CUE track's job makes a segmented sink, and a sink is
+            // finished once. Both arms are bugs in this file, not facts about
+            // the track, so neither is remembered as a failed analysis: that
+            // would keep a healthy track out of every later backfill.
             (FinishedAnalysis::Segmented(_), None) => {
-                unreachable!("only a CUE track's job makes a segmented sink")
+                debug_assert!(false, "a segmented analysis finished without its CUE job");
+                return Err(query_error(
+                    "a segmented analysis finished without its CUE job",
+                ));
+            }
+            (FinishedAnalysis::AlreadyFinished, _) => {
+                return Err(query_error("the analysis session was already finished"));
             }
         };
 
