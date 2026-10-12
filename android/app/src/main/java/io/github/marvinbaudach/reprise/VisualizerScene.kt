@@ -1,6 +1,5 @@
 package io.github.marvinbaudach.reprise
 
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RadialGradient
 import android.graphics.Shader
@@ -19,11 +18,16 @@ import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.core.graphics.withTranslation
 import io.github.marvinbaudach.reprise.ui.theme.AmbientTrueBlack
 import io.github.marvinbaudach.reprise.ui.theme.spectralColour
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
+import uniffi.reprise_android_ffi.AndroidBassPressure
 import uniffi.reprise_android_ffi.AndroidVisualEngine
+import uniffi.reprise_android_ffi.AndroidVisualEngineInterface
+import uniffi.reprise_android_ffi.AndroidVisualFrame
 
 internal interface VisualSceneEngine : AutoCloseable {
     fun setAccent(red: Float, green: Float, blue: Float)
@@ -111,17 +115,52 @@ internal object NativeVisualSceneEngineFactory : VisualSceneEngineFactory {
     override fun create(): VisualSceneEngine = NativeVisualSceneEngine(AndroidVisualEngine())
 }
 
+/**
+ * The phone-side owner of one native visual engine.
+ *
+ * Every call below crosses the UniFFI/JNA boundary, which costs more than the
+ * Rust behind many of them, and this class runs on the UI thread once per
+ * display frame. So a frame costs two crossings: [tick] advances the engine
+ * and brings back what [hasLiveAudio] and [bassPressure] would be asked next
+ * (kept in [sampledFrame] and served from there for [FRAME_ANSWER_MAX_AGE_NANOS]),
+ * and the draw phase reads [sceneBytes]. [setPlaying] and [setAccent] cross
+ * only when their value changed.
+ */
 internal class NativeVisualSceneEngine(
-    private val native: AndroidVisualEngine,
+    private val native: AndroidVisualEngineInterface,
+    private val nanoClock: () -> Long = System::nanoTime,
 ) : VisualSceneEngine, LivePcmConsumer {
     private var sceneCallsUntilCounterLog = 0
 
-    override fun setAccent(red: Float, green: Float, blue: Float) =
+    // Written from the UI thread and, for the resets, from the audio thread.
+    @Volatile private var sampledFrame: SampledFrame? = null
+
+    // Bumped by every stream boundary, so a frame answer already in flight when
+    // one lands is born stale instead of outliving it.
+    private val boundaryEpoch = AtomicInteger()
+
+    @Volatile private var sentPlaying: Boolean? = null
+    @Volatile private var sentAccent: SentAccent? = null
+
+    override fun setAccent(red: Float, green: Float, blue: Float) {
+        if (sentAccent?.matches(red, green, blue) == true) return
         native.setAccent(red, green, blue)
+        sentAccent = SentAccent(red, green, blue)
+    }
 
-    override fun setPlaying(playing: Boolean) = native.setPlaying(playing)
+    override fun setPlaying(playing: Boolean) {
+        if (sentPlaying == playing) return
+        native.setPlaying(playing)
+        sentPlaying = playing
+        // A pause silences the pressure and a start can bring live audio back.
+        forgetSampledFrame()
+    }
 
-    override fun noteTrackChanged() = native.noteTrackChanged()
+    override fun noteTrackChanged() {
+        forgetSampledState()
+        native.noteTrackChanged()
+        forgetSampledState()
+    }
 
     override fun ingestBands(bands: FloatArray) = native.ingestBands(bands.asList())
 
@@ -131,10 +170,17 @@ internal class NativeVisualSceneEngine(
 
     override fun adoptableBandsAreLive(): Boolean = native.adoptableBandsAreLive()
 
-    override fun adoptShape(bands: FloatArray) = native.adoptShape(bands.asList())
+    override fun adoptShape(bands: FloatArray) {
+        forgetSampledState()
+        native.adoptShape(bands.asList())
+        forgetSampledState()
+    }
 
-    override fun setPlaybackIntent(playbackIntended: Boolean) =
+    override fun setPlaybackIntent(playbackIntended: Boolean) {
+        forgetSampledFrame()
         native.setPlaybackIntended(playbackIntended)
+        forgetSampledFrame()
+    }
 
     override fun ingestPcm16(
         bytes: ByteArray,
@@ -152,26 +198,46 @@ internal class NativeVisualSceneEngine(
 
     override fun resetAudioStream() {
         VisualizerEdgeLog.resetAudioStream()
+        forgetSampledState()
         native.resetAudioStream()
+        forgetSampledState()
     }
 
-    override fun resetAudioHistory() = native.resetAudioHistory()
-
-    override fun hasLiveAudio(): Boolean = native.hasLiveAudio()
-
-    override fun bassPressure(): VisualBassPressure = native.bassPressure().let { pressure ->
-        VisualBassPressure(
-            levelDbfs = pressure.levelDbfs,
-            baselineDbfs = pressure.baselineDbfs,
-            impact = pressure.impact,
-            aura = pressure.aura,
-            kick = pressure.kick,
-            pressure = pressure.pressure,
-        )
+    override fun resetAudioHistory() {
+        forgetSampledFrame()
+        native.resetAudioHistory()
+        forgetSampledFrame()
     }
+
+    override fun hasLiveAudio(): Boolean =
+        freshSampledFrame()?.frame?.hasLiveAudio ?: native.hasLiveAudio()
+
+    override fun bassPressure(): VisualBassPressure =
+        (freshSampledFrame()?.frame?.bassPressure ?: native.bassPressure()).toVisualBassPressure()
 
     override fun tick() {
-        native.tick()
+        val epoch = boundaryEpoch.get()
+        sampledFrame = SampledFrame(native.frame(), nanoClock(), epoch)
+    }
+
+    /** The last [tick]'s answer, unless something since could have changed it. */
+    private fun freshSampledFrame(): SampledFrame? = sampledFrame?.takeIf {
+        it.epoch == boundaryEpoch.get() && nanoClock() - it.atNanos <= FRAME_ANSWER_MAX_AGE_NANOS
+    }
+
+    /**
+     * Drops what the native engine may have changed behind our back: its
+     * stream boundaries re-open the stored state, so the next [setPlaying] must
+     * reach it and the next frame answer must come from it.
+     */
+    private fun forgetSampledState() {
+        forgetSampledFrame()
+        sentPlaying = null
+    }
+
+    private fun forgetSampledFrame() {
+        boundaryEpoch.incrementAndGet()
+        sampledFrame = null
     }
 
     override fun sceneBytes(width: Float, height: Float): ByteArray =
@@ -195,8 +261,41 @@ internal class NativeVisualSceneEngine(
         Log.i(VISUAL_SCENE_LOG_TAG, "dropped_audio_frames=$dropped")
     }
 
-    override fun close() = native.close()
+    override fun close() {
+        (native as? AutoCloseable)?.close()
+    }
+
+    private class SampledFrame(
+        val frame: AndroidVisualFrame,
+        val atNanos: Long,
+        val epoch: Int,
+    )
+
+    private class SentAccent(val red: Float, val green: Float, val blue: Float) {
+        fun matches(red: Float, green: Float, blue: Float): Boolean =
+            red.toRawBits() == this.red.toRawBits() &&
+                green.toRawBits() == this.green.toRawBits() &&
+                blue.toRawBits() == this.blue.toRawBits()
+    }
+
+    private companion object {
+        /**
+         * How long a [tick]'s answer still stands in for a fresh query: about
+         * three 60 Hz frames. A longer gap (a janky frame, a closed power gate)
+         * asks the native engine again, whose live-audio window is 500 ms.
+         */
+        const val FRAME_ANSWER_MAX_AGE_NANOS = 50_000_000L
+    }
 }
+
+private fun AndroidBassPressure.toVisualBassPressure() = VisualBassPressure(
+    levelDbfs = levelDbfs,
+    baselineDbfs = baselineDbfs,
+    impact = impact,
+    aura = aura,
+    kick = kick,
+    pressure = pressure,
+)
 
 internal fun DrawScope.drawPlayedVisualizer(
     buffer: ByteArray,
@@ -323,9 +422,8 @@ private fun DrawScope.drawFlatRadialGlow(
     painter.draw(drawContext.canvas.nativeCanvas, center, radius, header.color)
 }
 
-private class RadialGlowPainter {
+internal class RadialGlowPainter {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val matrix = Matrix()
     // Insertion-order eviction is safe while bars is the only mode emitting radial glows: its RGB
     // comes only from the bar index, for at most BAR_COUNT (currently 64) bit-identical keys. A future
     // mode with continuously varying glow colours would make the eviction policy matter.
@@ -334,16 +432,20 @@ private class RadialGlowPainter {
     fun draw(canvas: android.graphics.Canvas, center: Offset, radius: Float, color: Color) {
         val argb = color.toArgb()
         val rgb = argb and RGB_MASK
-        val shader = shaderFor(rgb)
-        matrix.setScale(radius, radius)
-        matrix.postTranslate(center.x, center.y)
-        shader.setLocalMatrix(matrix)
-        paint.shader = shader
+        // The gradient lives in the unit circle and the canvas places it. Shader.setLocalMatrix
+        // discards the native shader, so positioning it per draw made Paint.getNativeInstance
+        // rebuild it every frame: simpleperf on a Pixel (release, spectrum visualizer playing)
+        // put RadialGradient_create at 2.8 % of the main thread, about 4 % with the Skia
+        // gradient setup. The shader now stays at its identity matrix and is built once per colour.
+        paint.shader = shaderFor(rgb)
         paint.alpha = argb ushr ALPHA_SHIFT
-        canvas.drawCircle(center.x, center.y, radius, paint)
+        canvas.withTranslation(center.x, center.y) {
+            scale(radius, radius)
+            drawCircle(0f, 0f, 1f, paint)
+        }
     }
 
-    private fun shaderFor(rgb: Int): RadialGradient {
+    internal fun shaderFor(rgb: Int): RadialGradient {
         shaders[rgb]?.let { return it }
         if (shaders.size == MAX_CACHED_GLOW_COLOURS) {
             val oldest = shaders.entries.iterator()
