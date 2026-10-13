@@ -1503,6 +1503,24 @@ result.
   `mtp_68_the_masked_total_is_what_the_last_frame_says_not_a_guess_from_the_file_length`.
   <!-- REVIEW: rule proposal -->
 
+- **MTP-69** [active] [core] [gtk] — **The "Rules for this phone" switches
+  during a running sync.** "Sync automatically when this phone connects"
+  (`MTP-30`) is read only on connect and never touches a running sync, so it
+  stays editable while a sync runs and is saved on its own: no delta
+  recomputation, and the sync phase and any sync error are left as they are.
+  "Remove from phone when removed from a playlist" (`MTP-33`) applies to the
+  next synchronization and is locked while the phone synchronizes: the switch
+  is insensitive, and both its tooltip and a visible dim label say why, so the
+  reason remains available without a pointer and the switch never snaps back
+  to the stored value.
+  *Tests:* `mtp_69_the_automatic_sync_switch_is_saved_while_a_sync_is_running`,
+  `mtp_69_a_non_rememberable_device_updates_automatic_sync_in_memory_while_busy`,
+  `mtp_69_a_failed_automatic_sync_save_notifies_the_stored_value`,
+  `mtp_69_the_remove_deleted_switch_stays_locked_while_a_sync_is_running`,
+  `mtp_69_the_remove_deleted_switch_is_locked_while_a_sync_runs`,
+  `mtp_69_the_automatic_sync_switch_stays_editable_while_a_sync_runs`,
+  `mtp_69_the_remove_deleted_switch_unlocks_when_the_sync_ends`.
+
 ## F. Settings & modals
 
 - **SET-1** [planned] [gtk] — Preferences = one window with vertical
