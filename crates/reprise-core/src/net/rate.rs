@@ -21,6 +21,7 @@ pub(crate) enum RateLimitKey {
     Lrclib,
     Netease,
     Deezer,
+    Wikimedia,
 }
 
 impl RateLimitKey {
@@ -33,6 +34,7 @@ impl RateLimitKey {
             Self::AcoustId => Duration::from_millis(334),
             Self::Lrclib | Self::Netease => Duration::from_millis(250),
             Self::Deezer => Duration::from_millis(300),
+            Self::Wikimedia => Duration::from_millis(500),
         }
     }
 
@@ -41,7 +43,7 @@ impl RateLimitKey {
     }
 }
 
-const KEY_COUNT: usize = 8;
+const KEY_COUNT: usize = 9;
 const SLICE: Duration = Duration::from_millis(50);
 
 // One mutex per key: no cross-provider contention, and a poisoned slot stays isolated.

@@ -59,9 +59,12 @@ pub(crate) fn is_fresh(fetched_at: i64, now: i64, positive: bool) -> bool {
 
 /// Resolves the current positive, negative, or refreshable cache state.
 pub fn verdict(dir: &Path, name: &str, now: i64) -> CacheVerdict {
+    let _guard = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let portrait = portrait_path_in(dir, name);
     if let Some(path) = portrait.as_ref() {
-        if is_fresh(file_epoch_secs(path), now, true) {
+        if super::sidecar::read(dir, name).is_some() && is_fresh(file_epoch_secs(path), now, true) {
             return CacheVerdict::FreshPortrait(path.clone());
         }
     }
@@ -82,21 +85,51 @@ pub(crate) fn file_epoch_secs(path: &Path) -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn store_image(dir: &Path, name: &str, bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    store_portrait(
+        dir,
+        name,
+        bytes,
+        ext,
+        &super::sidecar::PortraitRecord::deezer(),
+    )
+}
+
+pub(crate) fn store_portrait(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    ext: &str,
+    record: &super::sidecar::PortraitRecord,
+) -> Option<PathBuf> {
     let _guard = CACHE_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::fs::create_dir_all(dir).ok()?;
     let key = key_for(name);
     let output = dir.join(format!("{key}.{ext}"));
-    let temporary = dir.join(format!(".{key}-{}.{ext}.tmp", fastrand::u64(..)));
-    if std::fs::write(&temporary, bytes).is_err() {
+    let nonce = fastrand::u64(..);
+    let temporary = dir.join(format!(".{key}-{nonce}.{ext}.tmp"));
+    let record_output = super::sidecar::path(dir, name);
+    let record_temporary = dir.join(format!(".{key}-{nonce}.json.tmp"));
+    let record_bytes = super::sidecar::encoded(record)?;
+    if std::fs::write(&temporary, bytes).is_err()
+        || std::fs::write(&record_temporary, record_bytes).is_err()
+    {
         let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(&record_temporary);
         return None;
     }
     if std::fs::rename(&temporary, &output).is_err() {
         let _ = std::fs::remove_file(&temporary);
-        return portrait_path_in(dir, name);
+        let _ = std::fs::remove_file(&record_temporary);
+        return None;
+    }
+    if std::fs::rename(&record_temporary, &record_output).is_err() {
+        let _ = std::fs::remove_file(&record_temporary);
+        let _ = std::fs::remove_file(&record_output);
+        return None;
     }
     for old_extension in IMAGE_EXTS {
         if *old_extension != ext {
@@ -110,7 +143,20 @@ pub(crate) fn store_image(dir: &Path, name: &str, bytes: &[u8], ext: &str) -> Op
 pub(crate) fn refresh_image(dir: &Path, name: &str, path: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(path).ok()?;
     let extension = path.extension()?.to_str()?;
-    store_image(dir, name, &bytes, extension)
+    let record =
+        super::sidecar::read(dir, name).unwrap_or_else(super::sidecar::PortraitRecord::deezer);
+    store_portrait(dir, name, &bytes, extension, &record)
+}
+
+pub(crate) fn remove_portrait(dir: &Path, name: &str) {
+    let _guard = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = key_for(name);
+    for extension in IMAGE_EXTS {
+        let _ = std::fs::remove_file(dir.join(format!("{key}.{extension}")));
+    }
+    let _ = std::fs::remove_file(super::sidecar::path(dir, name));
 }
 
 pub(crate) fn write_negative(dir: &Path, name: &str) {
@@ -127,6 +173,7 @@ pub(crate) fn write_negative(dir: &Path, name: &str) {
         for extension in IMAGE_EXTS {
             let _ = std::fs::remove_file(dir.join(format!("{key}.{extension}")));
         }
+        let _ = std::fs::remove_file(super::sidecar::path(dir, name));
         return;
     }
     let _ = std::fs::remove_file(temporary);
@@ -155,6 +202,8 @@ pub(crate) fn prune_except(dir: &Path, retained_keys: &HashSet<String>) {
 
 fn cache_entry_key(file_name: &str) -> Option<&str> {
     let key = if let Some(key) = file_name.strip_suffix(".notfound") {
+        key
+    } else if let Some(key) = file_name.strip_suffix(".json") {
         key
     } else {
         IMAGE_EXTS
@@ -261,5 +310,42 @@ mod tests {
         assert!(!old.exists());
         assert!(!negative_marker_path(&dir, "Band").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn net_9_store_publishes_the_image_before_replacing_its_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = super::super::sidecar::PortraitRecord::deezer();
+        store_portrait(dir.path(), "Band", b"old", "jpg", &original).unwrap();
+        let blocked_output = dir.path().join(format!("{}.png", key_for("Band")));
+        std::fs::create_dir(&blocked_output).unwrap();
+        let replacement =
+            super::super::sidecar::PortraitRecord::commons(super::super::sidecar::PortraitCredit {
+                author: "Photographer".to_owned(),
+                license: "CC0".to_owned(),
+                license_url: "https://creativecommons.org/publicdomain/zero/1.0".to_owned(),
+                file_page_url: "https://commons.wikimedia.org/wiki/File:Band.png".to_owned(),
+            });
+
+        assert!(store_portrait(dir.path(), "Band", b"new", "png", &replacement).is_none());
+        assert_eq!(
+            super::super::sidecar::read(dir.path(), "Band"),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn net_9_refresh_with_an_unreadable_sidecar_records_deezer_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = store_image(dir.path(), "Band", b"image", "jpg").unwrap();
+        std::fs::write(super::super::sidecar::path(dir.path(), "Band"), b"not json").unwrap();
+
+        let refreshed = refresh_image(dir.path(), "Band", &image).unwrap();
+
+        assert_eq!(refreshed, image);
+        assert_eq!(
+            super::super::sidecar::read(dir.path(), "Band"),
+            Some(super::super::sidecar::PortraitRecord::deezer())
+        );
     }
 }
