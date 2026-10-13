@@ -233,6 +233,7 @@ class LibraryStatusChromeTest {
             statusTag = "library-status-error",
             page = "artist",
             elementBottom = textBottomInPixels(failure),
+            insetTag = "artist-detail-status-inset",
         )
     }
 
@@ -390,13 +391,27 @@ class LibraryStatusChromeTest {
     }
 
     private fun assertStatusBelowPlay(statusTag: String, page: String) {
-        assertStatusBelowElement(statusTag, page, bottomInPixels("$page-detail-play"))
+        assertStatusBelowElement(
+            statusTag = statusTag,
+            page = page,
+            elementBottom = bottomInPixels("$page-detail-play"),
+            insetTag = if (page == "artist") {
+                "artist-detail-status-inset"
+            } else {
+                "$page-detail-header"
+            },
+        )
     }
 
-    private fun assertStatusBelowElement(statusTag: String, page: String, elementBottom: Int) {
+    private fun assertStatusBelowElement(
+        statusTag: String,
+        page: String,
+        elementBottom: Int,
+        insetTag: String = "$page-detail-header",
+    ) {
         val statusTop = topInPixels(statusTag)
         assertTrue(statusTop >= elementBottom)
-        assertEquals(bottomInPixels("$page-detail-header") + 8f.toPixels(), statusTop)
+        assertEquals(bottomInPixels(insetTag) + 8f.toPixels(), statusTop)
     }
 
     private fun assertStopEntryAndCloseMenu() {
